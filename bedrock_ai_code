@@ -1,0 +1,233 @@
+import json
+import boto3
+import re
+
+# Initialize S3 and Comprehend clients
+s3_client = boto3.client('s3')
+comprehend_client = boto3.client('comprehend', region_name='us-east-1')
+bucket_name = "ai-3test"  # Replace with your S3 bucket name
+
+def lambda_handler(event, context):
+    # Initialize the Bedrock client
+    try:
+        client = boto3.client(service_name='bedrock-runtime', region_name='us-east-1')
+    except Exception as e:
+        return {
+            'statusCode': 500,
+            'body': json.dumps({"error": f"Failed to initialize Bedrock client: {str(e)}", 'statusCode': 500}),
+            'headers': {'Content-Type': 'application/json'}
+        }
+
+    # Extract the prompt, subject, and user_id from the event payload
+    try:
+        body = event.get('body', '{}')
+        if isinstance(body, str):
+            body = json.loads(body)
+
+        prompt = body.get('prompt', None)
+        user_id = body.get('user_id', None)
+        subject = body.get('subject', None)
+
+        if not prompt or not user_id or not subject:
+            return {
+                'statusCode': 400,
+                'body': json.dumps({"error": "Fields 'prompt', 'user_id', and 'subject' are required in the request body", 'statusCode': 400}),
+                'headers': {'Content-Type': 'application/json'}
+            }
+    except json.JSONDecodeError:
+        return {
+            'statusCode': 400,
+            'body': json.dumps({"error": "Invalid JSON in request body", 'statusCode': 400}),
+            'headers': {'Content-Type': 'application/json'}
+        }
+
+    # Step 2: Retrieve conversation history from S3 for the user
+    try:
+        s3_object_key = f"{user_id}_history.json"
+        conversation_history = get_conversation_history(s3_object_key)
+    except Exception as e:
+        return {
+            'statusCode': 500,
+            'body': json.dumps({"error": f"Failed to retrieve conversation history from S3: {str(e)}", 'statusCode': 500}),
+            'headers': {'Content-Type': 'application/json'}
+        }
+
+    # Extract only the user questions from the conversation history
+    user_questions = [line.replace("User: ", "") for line in conversation_history if line.startswith("User:")]
+
+    # Step 1: Check if the question is related to the subject
+    try:
+        relevance_prompt = (
+            f"Determine if the following query is related to the subject,I am also providing previously asked question if you are not sure that subject is related or not related to query then prefer questions history but if you are sure that query asked is not related to subject then strictly respond with No and dont prefer previous questions.\n\n"
+            f"Subject: {subject}\n"
+            f"Query: {prompt}\n\n"
+            f"Here is the history of user questions for context:\n"
+            f"If you are sure that Query is not related to subject, then return No."
+            + "\n".join(user_questions) +
+            f"\n\nRespond with Yes if it is related and No if it is not."
+        )
+
+        relevance_response = invoke_bedrock_model(client, relevance_prompt)
+        relevance_response_cleaned = relevance_response.strip().lower()
+
+        # Log the AI's raw response for debugging
+        print(f"Relevance Check AI Response: {relevance_response_cleaned}")
+
+        # Fuzzy matching or additional validation for the AI response
+        if "yes" in relevance_response_cleaned:
+            relevance_response_cleaned = "yes"
+        elif "no" in relevance_response_cleaned:
+            relevance_response_cleaned = "no"
+
+        # If response is not yes or no, handle it as an error
+        if relevance_response_cleaned not in ["yes", "no"]:
+            return {
+                'statusCode': 500,
+                'body': json.dumps({"error": f"Unexpected response from relevance check: {relevance_response_cleaned}", 'statusCode': 500}),
+                'headers': {'Content-Type': 'application/json'}
+            }
+
+        if relevance_response_cleaned == "no":
+            return {
+                'statusCode': 200,
+                'body': json.dumps({"result": "Question asked is not related to the subject"}),
+                'headers': {'Content-Type': 'application/json'}
+            }
+
+    except Exception as e:
+        return {
+            'statusCode': 500,
+            'body': json.dumps({"error": f"Failed during relevance check: {str(e)}", 'statusCode': 500}),
+            'headers': {'Content-Type': 'application/json'}
+        }
+
+    # Step 3: Append the new user input to the conversation history
+    conversation_history.append(f"User: {prompt}")
+
+    # Limit the conversation history to the last 10 items
+    if len(conversation_history) > 10:
+        conversation_history = conversation_history[-10:]
+
+    # Step 4: Extract keywords from the prompt
+    try:
+        keywords = extract_keywords(prompt)
+    except Exception as e:
+        return {
+            'statusCode': 500,
+            'body': json.dumps({"error": f"Failed to extract keywords: {str(e)}", 'statusCode': 500}),
+            'headers': {'Content-Type': 'application/json'}
+        }
+
+    # Step 5: Invoke Bedrock for answering the question
+    try:
+        dynamic_prompt = (
+            f"You are an expert on the subject: {subject}.\n"
+            "Respond concisely and directly to the following user question based on the context provided below.\n"
+            "Do not generate additional questions or repeat previous information. Limit the response to only relevant details.\n\n"
+            "Conversation history (most recent input at the end):\n"
+            + "\n".join(conversation_history) +
+            f"\n\nUser: {prompt}\n\nAI:"
+        )
+
+        final_response = invoke_bedrock_model(client, dynamic_prompt)
+        # Append AI response to conversation history
+        conversation_history.append(f"AI: {final_response}")
+
+        # Update conversation history in S3
+        update_conversation_history(s3_object_key, conversation_history)
+
+        # Return the final response with keywords
+        return {
+            'statusCode': 200,
+            'body': json.dumps({
+                "result": final_response,
+                "keywords": keywords
+            }),
+            'headers': {'Content-Type': 'application/json'}
+        }
+
+    except Exception as e:
+        return {
+            'statusCode': 500,
+            'body': json.dumps({"error": str(e), 'statusCode': 500}),
+            'headers': {'Content-Type': 'application/json'}
+        }
+
+# Helper function for invoking Bedrock model
+def invoke_bedrock_model(client, prompt):
+    """Invoke the Bedrock model and return the response as a string."""
+    try:
+        bedrock_request = {
+            "modelId": "meta.llama3-8b-instruct-v1:0",
+            "contentType": "application/json",
+            "accept": "application/json",
+            "body": json.dumps({
+                "prompt": prompt,
+                "max_gen_len": 100,  # Limit to a shorter response
+                "temperature": 0.3,  # Lower to make the response deterministic
+                "top_p": 0.9
+            })
+        }
+
+        response = client.invoke_model_with_response_stream(
+            modelId=bedrock_request['modelId'],
+            body=bedrock_request['body'],
+            contentType=bedrock_request['contentType'],
+            accept=bedrock_request['accept']
+        )
+
+        final_response = ""
+        for event in response['body']:
+            if 'chunk' in event and 'bytes' in event['chunk']:
+                decoded_chunk = event['chunk']['bytes'].decode('utf-8')
+                try:
+                    json_chunk = json.loads(decoded_chunk)
+                    if 'generation' in json_chunk:
+                        final_response += json_chunk['generation']
+                except json.JSONDecodeError:
+                    continue
+
+        # Post-process to clean the final response
+        final_response = re.sub(r'\s+', ' ', final_response).strip()
+
+        # Truncate the response to the last full stop
+        final_response = truncate_to_last_full_stop(final_response)
+
+        return final_response
+    except Exception as e:
+        raise RuntimeError(f"Error invoking Bedrock model: {str(e)}")
+
+# New helper function to truncate response to the last full stop
+def truncate_to_last_full_stop(response):
+    """Truncate the response to the last full stop before it cuts off."""
+    last_period_index = response.rfind('.')
+    if last_period_index != -1:
+        return response[:last_period_index + 1]  # Include the period
+    return response  # Return as is if no full stop is found
+
+# Helper functions for conversation history and keyword extraction
+def get_conversation_history(s3_object_key):
+    """Retrieve the conversation history from S3."""
+    try:
+        response = s3_client.get_object(Bucket=bucket_name, Key=s3_object_key)
+        conversation_history = json.loads(response['Body'].read().decode('utf-8'))
+        return conversation_history
+    except s3_client.exceptions.NoSuchKey:
+        return []
+
+def update_conversation_history(s3_object_key, conversation_history):
+    """Update the conversation history in S3."""
+    s3_client.put_object(
+        Bucket=bucket_name,
+        Key=s3_object_key,
+        Body=json.dumps(conversation_history).encode('utf-8')
+    )
+
+def extract_keywords(prompt):
+    """Extract keywords from the user prompt using AWS Comprehend."""
+    response = comprehend_client.detect_key_phrases(
+        Text=prompt,
+        LanguageCode='en'
+    )
+    keywords = [phrase['Text'] for phrase in response['KeyPhrases']]
+    return keywords
