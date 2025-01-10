@@ -5,7 +5,7 @@ import re
 # Initialize S3 and Comprehend clients
 s3_client = boto3.client('s3')
 comprehend_client = boto3.client('comprehend', region_name='us-east-1')
-bucket_name = "ai-3test"  # Replace with your S3 bucket name
+bucket_name = "ai"  # Replace with your S3 bucket name
 
 def lambda_handler(event, context):
     # Initialize the Bedrock client
