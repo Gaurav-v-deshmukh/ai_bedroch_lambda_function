@@ -1,0 +1,67 @@
+import json
+import boto3
+
+# Initialize the Bedrock Runtime client and S3 client
+bedrock_runtime = boto3.client("bedrock-runtime")
+s3_client = boto3.client("s3")
+
+MODEL_ID = "us.meta.llama3-2-90b-instruct-v1:0"
+
+def lambda_handler(event, context):
+    # Log the incoming event for debugging
+    print("Received event:", json.dumps(event))
+
+    # Parse the body of the event
+    body = json.loads(event['body'])  # Parse the JSON string in the body
+    s3_arn = body.get('s3_arn')
+    user_message = body.get('user_message')
+
+    # Check if s3_arn is provided
+    if not s3_arn:
+        return {
+            'statusCode': 400,
+            'body': json.dumps({'error': 's3_arn is required'})
+        }
+
+    # Parse the bucket name and object key from the ARN
+    parts = s3_arn.split(':')
+    if len(parts) == 6:
+        bucket_name = parts[5].split('/')[0]  # Extract bucket name
+        object_key = '/'.join(parts[5].split('/')[1:])  # Extract object key
+    else:
+        return {
+            'statusCode': 400,
+            'body': json.dumps({'error': 'Invalid ARN format'})
+        }
+
+    # Read the image from S3
+    response = s3_client.get_object(Bucket=bucket_name, Key=object_key)
+    image = response['Body'].read()
+
+    # Prepare the messages for the Bedrock request
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"image": {"format": "png", "source": {"bytes": image}}},
+                {"text": user_message},
+            ],
+        }
+    ]
+
+    # Send the request to Bedrock
+    response = bedrock_runtime.converse(
+        modelId=MODEL_ID,
+        messages=messages,
+    )
+
+    # Extract the response text
+    response_text = response["output"]["message"]["content"][0]["text"]
+    
+    # Log the response text (or handle it as needed)
+    print(response_text)
+
+    return {
+        'statusCode': 200,
+        'body': json.dumps({'response': response_text})
+    }
