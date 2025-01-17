@@ -1,0 +1,144 @@
+import json
+import boto3
+import os
+from datetime import datetime
+
+# Initialize the Bedrock Runtime client and S3 client
+bedrock_runtime = boto3.client("bedrock-runtime")
+s3_client = boto3.client("s3")
+
+MODEL_ID = "us.meta.llama3-2-90b-instruct-v1:0"
+HISTORY_BUCKET = "ai-2test"  # Set bucket name directly
+
+def lambda_handler(event, context):
+    # Log the incoming event for debugging
+    print("Received event:", json.dumps(event))
+
+    # Parse the body of the event
+    body = json.loads(event['body'])
+    s3_arn = body.get('s3_arn')
+    user_id = body.get('user_id')  # Get user ID from event
+    subject = body.get('subject')
+    user_message = body.get('user_message')  # Get user message from event
+
+    # Check if required fields are provided
+    if not s3_arn:
+        return {
+            'statusCode': 400,
+            'body': json.dumps({'error': 's3_arn is required'})
+        }
+    if not subject:
+        return {
+            'statusCode': 400,
+            'body': json.dumps({'error': 'subject is required'})
+        }
+    if not user_id:
+        return {
+            'statusCode': 400,
+            'body': json.dumps({'error': 'user_id is required'})
+        }
+    if not user_message:
+        return {
+            'statusCode': 400,
+            'body': json.dumps({'error': 'user_message is required'})
+        }
+
+    # Parse the bucket name and object key from the ARN
+    parts = s3_arn.split(':')
+    if len(parts) == 6:
+        bucket_name = parts[5].split('/')[0]
+        object_key = '/'.join(parts[5].split('/')[1:])
+    else:
+        return {
+            'statusCode': 400,
+            'body': json.dumps({'error': 'Invalid ARN format'})
+        }
+
+    # Read the image from S3
+    try:
+        response = s3_client.get_object(Bucket=bucket_name, Key=object_key)
+        image = response['Body'].read()
+    except Exception as e:
+        return {
+            'statusCode': 500,
+            'body': json.dumps({'error': f'Failed to read image from S3: {str(e)}'})
+        }
+
+    # Prepare the messages for the Bedrock request
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"image": {"format": "png", "source": {"bytes": image}}},
+                {"text": f"Is this image related to the subject '{subject}'? If yes, provide a detailed description. If no, say 'image is not related to subject'."},
+            ],
+        }
+    ]
+
+    # Send the request to Bedrock
+    try:
+        response = bedrock_runtime.converse(
+            modelId=MODEL_ID,
+            messages=messages,
+        )
+    except Exception as e:
+        return {
+            'statusCode': 500,
+            'body': json.dumps({'error': f'Failed to invoke Bedrock model: {str(e)}'})
+        }
+
+    # Extract the response text
+    try:
+        response_text = response["output"]["message"]["content"][0]["text"]
+    except KeyError:
+        return {
+            'statusCode': 500,
+            'body': json.dumps({'error': 'Unexpected response format from Bedrock'})
+        }
+
+    # Check if the image is related to the subject
+    if "image is not related to subject" in response_text:
+        return {
+            'statusCode': 200,
+            'body': json.dumps({'response': "image is not related to subject"})
+        }
+
+    # If related, save the interaction to S3
+    try:
+        history_key = f"{user_id}_history.json"
+        history_data = get_history(history_key)  # Get existing history
+        history_data.append({
+            "timestamp": str(datetime.now()),
+            "subject": subject,
+            "user_input": user_message,  # Use user_message here
+            "image_arn": s3_arn,
+            "ai_response": response_text
+        })
+        save_history(history_key, history_data) 
+    except Exception as e:
+        return {
+            'statusCode': 500,
+            'body': json.dumps({'error': f'Failed to save history to S3: {str(e)}'})
+        }
+
+    # If related, provide the original response
+    return {
+        'statusCode': 200,
+        'body': json.dumps({'response': response_text})
+    }
+
+def get_history(history_key):
+    """Retrieves history from S3 or initializes an empty list."""
+    try:
+        response = s3_client.get_object(Bucket=HISTORY_BUCKET, Key=history_key)
+        return json.loads(response['Body'].read().decode('utf-8'))
+    except s3_client.exceptions.NoSuchKey:
+        return []
+
+def save_history(history_key, history_data):
+    """Saves the interaction history to S3."""
+    s3_client.put_object(
+        Bucket=HISTORY_BUCKET,
+        Key=history_key,
+        Body=json.dumps(history_data).encode('utf-8')
+    )
